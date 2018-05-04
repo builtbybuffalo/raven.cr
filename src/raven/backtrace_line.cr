@@ -65,6 +65,10 @@ module Raven
         column = $~["col"]?
         method = $~["method"]?
       end
+
+	  file = "<Unknown>" unless file
+	  method = unparsed_line unless method
+
       new(file, number.try(&.to_i), column.try(&.to_i), method)
     end
 
