@@ -3,7 +3,7 @@ module Raven
     IGNORED_LINES_PATTERN = /_sigtramp|__crystal_(sigfault_handler|raise)|CallStack|caller:|raise<(.+?)>:NoReturn/
 
     class_getter default_filters = [
-      ->(line : String) { line.match(IGNORED_LINES_PATTERN) ? nil : line },
+      ->(line : String) { line unless line.match(IGNORED_LINES_PATTERN) },
     ] of String -> String?
 
     getter lines : Array(Line)
@@ -18,9 +18,7 @@ module Raven
         end
       end.compact
 
-      lines = filtered_lines.map do |unparsed_line|
-        Line.parse(unparsed_line)
-      end
+      lines = filtered_lines.map &->Line.parse(String)
       new(lines)
     end
 
@@ -38,9 +36,9 @@ module Raven
     end
 
     def inspect(io)
-      io << "<Backtrace: "
+      io << "#<Backtrace: "
       @lines.join(", ", io, &.inspect(io))
-      io << ">"
+      io << '>'
     end
   end
 end

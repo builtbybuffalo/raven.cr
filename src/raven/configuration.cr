@@ -5,12 +5,10 @@ module Raven
   class Configuration
     # Array of required properties needed to be set, before
     # `Configuration` is considered valid.
-    REQUIRED_OPTIONS = %i(host public_key secret_key project_id)
+    REQUIRED_OPTIONS = %i(host public_key project_id)
 
     # Array of exception classes that should never be sent.
-    IGNORE_DEFAULT = [
-      "Kemal::Exceptions::RouteNotFound",
-    ]
+    IGNORE_DEFAULT = [] of Exception.class | String
 
     # Note the order - we have to remove circular references and bad characters
     # before passing to other processors.
@@ -29,7 +27,7 @@ module Raven
     DEFAULT_REQUEST_METHODS_FOR_DATA_SANITIZATION = %w(POST PUT PATCH)
 
     # Used in `#in_app_pattern`.
-    property src_path : String? = {{ flag?(:debug) ? `pwd`.strip.stringify : nil }}
+    property src_path : String? = {{ `pwd`.strip.stringify if flag?(:debug) }}
 
     # Directories to be recognized as part of your app. e.g. if you
     # have an `engines` dir at the root of your project, you may want
@@ -73,7 +71,8 @@ module Raven
       }
     end
 
-    # `KEMAL_ENV` by default.
+    # Defaults to `SENTRY_CURRENT_ENV` or `KEMAL_ENV` `ENV` variables if set,
+    # `"default"` otherwise.
     property current_environment : String?
 
     # Encoding type for event bodies.
@@ -100,7 +99,7 @@ module Raven
     # See `IGNORE_DEFAULT`.
     #
     # NOTE: You should probably append to this rather than overwrite it.
-    property excluded_exceptions : Array(String)
+    property excluded_exceptions : Array(Exception.class | String)
 
     # NOTE: DSN component - set automatically if DSN provided.
     property host : String?
@@ -145,17 +144,28 @@ module Raven
     # We automatically try to set this to a git SHA or Capistrano release.
     property release : String?
 
+    # The sampling factor to apply to events. A value of `0.0` will not send
+    # any events, and a value of `1.0` will send 100% of events.
+    property sample_rate : Float64 = 1.0
+
+    # `Random` instance used when `sample_rate` is set.
+    property random : Random { Random::DEFAULT }
+
     # Should sanitize values that look like credit card numbers?
     #
     # See `Processor::SanitizeData::CREDIT_CARD_PATTERN`.
     property? sanitize_credit_cards = true
 
     # By default, Sentry censors `Hash` values when their keys match things like
-    # `"secret"`, `"password"`, etc. Provide an `Array` of `String`s that, when matched in
-    # a hash key, will be censored and not sent to Sentry.
+    # `"secret"`, `"password"`, etc. Provide an `Array` of `String`s that,
+    # when matched in a hash key, will be censored and not sent to Sentry.
     #
     # See `Processor::SanitizeData::DEFAULT_FIELDS`.
     property sanitize_fields = [] of String | Regex
+
+    # If you're sure you want to override the default sanitization values, you can
+    # add to them to an array of `String`s here, e.g. `%w(authorization password)`.
+    property sanitize_fields_excluded = [] of String | Regex
 
     # Sanitize additional HTTP headers - only `Authorization` is removed by default.
     #
@@ -180,7 +190,10 @@ module Raven
       property ssl : OpenSSL::SSL::Context::Client?
     {% end %}
 
-    # Secret key for authentication with the Sentry server
+    # Secret key for authentication with the Sentry server.
+    #
+    # DEPRECATED: This is deprecated and not necessary for newer Sentry
+    # installations any more.
     #
     # NOTE: If you provide a DSN, this will be set automatically.
     property secret_key : String?
@@ -213,10 +226,13 @@ module Raven
     # Timeout when waiting for the server to return data.
     property read_timeout : Time::Span = 2.seconds
 
-    # Optional `Proc`, called when the Sentry server cannot be contacted for any reason.
+    # Optional `Proc`, called when the Sentry server cannot be contacted
+    # for any reason.
     #
     # ```
-    # ->(event : Raven::Event::HashType) { spawn { MyJobProcessor.send_email(event) } }
+    # ->(event : Raven::Event::HashType) {
+    #   spawn { MyJobProcessor.send_email(event) }
+    # }
     # ```
     property transport_failure_callback : Proc(Event::HashType, Nil)?
 
@@ -228,18 +244,18 @@ module Raven
       }
     end
 
-    # Errors object - an Array that contains error messages.
+    # Errors object - an `Array` containing error messages.
     getter errors = [] of String
 
     def initialize
-      @current_environment = ENV["KEMAL_ENV"]?
+      @current_environment = current_environment_from_env
       @exclude_loggers = [Logger::PROGNAME]
       @excluded_exceptions = IGNORE_DEFAULT.dup
       @logger = Logger.new(STDOUT)
       @processors = DEFAULT_PROCESSORS.dup
       @sanitize_data_for_request_methods = DEFAULT_REQUEST_METHODS_FOR_DATA_SANITIZATION.dup
       @release = detect_release
-      @server_name = resolve_hostname
+      @server_name = server_name_from_env
 
       # try runtime ENV variable first
       if dsn = ENV["SENTRY_DSN"]?
@@ -294,18 +310,24 @@ module Raven
       detect_release_from_git || detect_release_from_capistrano || detect_release_from_heroku
     end
 
-    private def detect_release_from_heroku
-      sys_dyno_info = File.read("/etc/heroku/dyno").strip rescue nil
-      return unless sys_dyno_info
+    private def running_on_heroku?
+      File.directory?("/etc/heroku")
+    end
 
-      # being overly cautious, because if we raise an error Raven won't start
-      begin
-        hash = JSON.parse(sys_dyno_info)
-        hash.try(&.[]?("release")).try(&.[]?("commit")).try(&.as_s)
-      rescue JSON::Error
-        logger.error "Cannot parse Heroku JSON: #{sys_dyno_info}"
-        nil
+    private def heroku_dyno_metadata_message
+      "You are running on Heroku but haven't enabled Dyno Metadata. " \
+      "For Sentry's release detection to work correctly, please run " \
+      "`heroku labs:enable runtime-dyno-metadata`"
+    end
+
+    private def detect_release_from_heroku
+      return unless running_on_heroku?
+      return if ENV["CI"]?
+      if commit = ENV["HEROKU_SLUG_COMMIT"]?
+        return commit
       end
+      logger.warn(heroku_dyno_metadata_message)
+      nil
     end
 
     private def detect_release_from_capistrano
@@ -321,15 +343,30 @@ module Raven
       Raven.sys_command_compiled("git rev-parse HEAD")
     end
 
+    private def heroku_dyno_name
+      return unless running_on_heroku?
+      ENV["DYNO"]?
+    end
+
     # Try to resolve the hostname to an FQDN, but fall back to whatever
     # the load name is.
     private def resolve_hostname
       System.hostname
     end
 
+    private def server_name_from_env
+      heroku_dyno_name || resolve_hostname
+    end
+
+    private def current_environment_from_env
+      ENV["SENTRY_CURRENT_ENV"]? || ENV["KEMAL_ENV"]? || "default"
+    end
+
     def capture_allowed?
       @errors = [] of String
-      valid? && capture_in_current_environment?
+      valid? &&
+        capture_in_current_environment? &&
+        sample_allowed?
     end
 
     def capture_allowed?(message_or_exc)
@@ -341,7 +378,7 @@ module Raven
     end
 
     private def capture_in_current_environment?
-      return true unless environments.any? && !environments.includes?(@current_environment)
+      return true if environments.empty? || environments.includes?(@current_environment)
       @errors << "Not configured to send/capture in environment '#{@current_environment}'"
       false
     end
@@ -349,6 +386,13 @@ module Raven
     private def capture_allowed_by_callback?(message_or_exc)
       return true if !should_capture || should_capture.try &.call(message_or_exc)
       @errors << "#should_capture returned false"
+      false
+    end
+
+    private def sample_allowed?
+      return true if sample_rate == 1.0
+      return true unless random.rand >= sample_rate
+      @errors << "Excluded by random sample"
       false
     end
 
@@ -360,7 +404,12 @@ module Raven
 
     def excluded_exception?(ex)
       return false unless ex.is_a?(Exception)
-      return false unless excluded_exceptions.includes?(ex.class.name)
+      return false unless excluded_exceptions.any? do |klass|
+                            case klass
+                            when Exception.class then klass >= ex.class
+                            when String          then klass == ex.class.name
+                            end
+                          end
       @errors << "User excluded error: #{ex.inspect}"
       true
     end
